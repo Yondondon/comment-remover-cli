@@ -1,186 +1,170 @@
-/*
-Copyright © 2026 NAME HERE <EMAIL ADDRESS>
-*/
 package cmd
 
 import (
 	"bytes"
 	"fmt"
+	"go/format"
 	"go/scanner"
 	"go/token"
-	"log"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 )
 
-type Comment struct {
-	Start int
-	End   int
-}
+type commentSpan struct{ start, end int }
 
-var Path string
-var dirCounter = 0
-var fileCounter = 0
-
-// removeCmd represents the remove command
 var removeCmd = &cobra.Command{
 	Use:   "remove",
-	Short: "remove short",
-	Long:  `remove long`,
+	Short: "Remove comments from .go files",
+	Long:  "Remove comments from a .go file, or from all .go files in a directory.",
 	Args:  cobra.NoArgs,
-	RunE:  removeComments,
+	RunE:  runRemove,
 }
 
 func init() {
 	rootCmd.AddCommand(removeCmd)
 
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// removeCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	removeCmd.Flags().BoolP("recursive", "r", false, "recursively checks files in subdirectories")
-	removeCmd.Flags().StringVarP(&Path, "path", "p", "$HOME", "path to file or directory")
-	removeCmd.MarkFlagRequired("path")
+	f := removeCmd.Flags()
+	f.BoolP("recursive", "r", false, "recursively checks subdirectories")
+	f.StringP("path", "p", "", "(required) path to file or directory")
+	_ = removeCmd.MarkFlagRequired("path")
 }
 
-func readFile(path string) []byte {
-	src, err := os.ReadFile(path)
+func runRemove(cmd *cobra.Command, _ []string) error {
+	path, err := cmd.Flags().GetString("path")
 	if err != nil {
-		log.Fatal(err)
-		os.Exit(1)
+		return err
+	}
+	recursive, err := cmd.Flags().GetBool("recursive")
+	if err != nil {
+		return err
 	}
 
-	return src
-}
-
-func writeFile(path string, src []byte) {
-	err := os.WriteFile(path, src, 0666)
+	files, err := collectGoFiles(path, recursive)
 	if err != nil {
-		log.Fatal(err)
-		os.Exit(1)
+		return err
 	}
+
+	var g errgroup.Group
+	g.SetLimit(runtime.NumCPU())
+	for _, file := range files {
+		g.Go(func() error { return processFile(file) })
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(cmd.OutOrStdout(), "Processed %d file(s).\n", len(files))
+	return nil
 }
 
-func scanComments(src []byte) []Comment {
+func collectGoFiles(root string, recursive bool) ([]string, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		if filepath.Ext(root) != ".go" {
+			return nil, fmt.Errorf("%s is not a .go file", root)
+		}
+		return []string{root}, nil
+	}
+
+	var files []string
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if p != root && !recursive {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(p) == ".go" {
+			files = append(files, p)
+		}
+		return nil
+	})
+	return files, err
+}
+
+func isDirective(lit string) bool {
+	return strings.HasPrefix(lit, "//go:") || strings.HasPrefix(lit, "// +build")
+}
+
+func scanComments(src []byte) []commentSpan {
 	fset := token.NewFileSet()
 	file := fset.AddFile("", fset.Base(), len(src))
 
 	var s scanner.Scanner
 	s.Init(file, src, nil, scanner.ScanComments)
 
-	var comments []Comment
-
+	var spans []commentSpan
 	for {
 		pos, tok, lit := s.Scan()
 		if tok == token.EOF {
 			break
 		}
-
-		if tok == token.COMMENT {
+		if tok == token.COMMENT && !isDirective(lit) {
 			start := file.Offset(pos)
-			comments = append(comments, Comment{
-				Start: start,
-				End:   start + len(lit),
-			})
+			spans = append(spans, commentSpan{start, start + len(lit)})
 		}
 	}
-
-	return comments
+	return spans
 }
 
-func removeComments(cmd *cobra.Command, args []string) error {
-	path, err := cmd.Flags().GetString("path")
-	if err != nil {
-		return err
+func stripComments(src []byte) ([]byte, error) {
+	spans := scanComments(src)
+	if len(spans) == 0 {
+		return src, nil
 	}
 
-	isRecursive, err := cmd.Flags().GetBool("recursive")
-	if err != nil {
-		return err
-	}
-
-	switch pathType := determinePathType(path); pathType {
-	case "file":
-		processFile(path)
-	case "directory":
-		processDirectory(path, isRecursive)
-	}
-	return nil
-}
-
-func determinePathType(path string) string {
-	info, err := os.Stat(path)
-	if err != nil {
-		log.Fatal(err)
-		os.Exit(1)
-	}
-
-	if info.IsDir() {
-		return "directory"
-	} else {
-		return "file"
-	}
-}
-
-func processFile(path string) {
-	fileCounter++
-	fmt.Println("file:", fileCounter)
-	return
-	src := readFile(path)
-	comments := scanComments(src)
-
-	var result bytes.Buffer
+	var out bytes.Buffer
 	cursor := 0
 
-	for _, c := range comments {
-		lineStart := bytes.LastIndexByte(src[:c.Start], '\n') + 1
-		prefix := src[lineStart:c.Start]
-		isWholeLine := len(bytes.TrimSpace(prefix)) == 0
+	for _, c := range spans {
+		lineStart := bytes.LastIndexByte(src[:c.start], '\n') + 1
+		wholeLine := len(bytes.TrimSpace(src[lineStart:c.start])) == 0
 
-		if isWholeLine {
-			result.Write(src[cursor:lineStart])
+		if !wholeLine {
+			out.Write(src[cursor:c.start])
+			cursor = c.end
+			continue
+		}
 
-			cursor = c.End
-			for cursor < len(src) &&
-				(src[cursor] == ' ' || src[cursor] == '\t' || src[cursor] == '\r') {
-				cursor++
-			}
-			if cursor < len(src) && src[cursor] == '\n' {
-				cursor++
-			}
-		} else {
-			result.Write(src[cursor:c.Start])
-			cursor = c.End
+		out.Write(src[cursor:lineStart])
+		cursor = c.end
+		for cursor < len(src) && (src[cursor] == ' ' || src[cursor] == '\t' || src[cursor] == '\r') {
+			cursor++
+		}
+		if cursor < len(src) && src[cursor] == '\n' {
+			cursor++
 		}
 	}
+	out.Write(src[cursor:])
 
-	result.Write(src[cursor:])
-	writeFile(path, result.Bytes())
+	return format.Source(out.Bytes())
 }
 
-func processDirectory(path string, isRecursive bool) {
-	dirCounter++
-	fmt.Println("dir:", dirCounter)
-	entries, err := os.ReadDir(path)
+func processFile(path string) error {
+	src, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatal(err)
-		os.Exit(1)
+		return err
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
-			fullPath := filepath.Join(path, entry.Name())
-			go processDirectory(fullPath, false)
-		} else {
-			if ext := filepath.Ext(filepath.Join(path, entry.Name())); ext == ".go" {
-				go processFile(filepath.Join(path, entry.Name()))
-			}
-		}
+	result, err := stripComments(src)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
 	}
+	if bytes.Equal(src, result) {
+		return nil
+	}
+
+	return os.WriteFile(path, result, 0o644)
 }
