@@ -40,12 +40,12 @@ func runRemove(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	recursive, err := cmd.Flags().GetBool("recursive")
+	isRecursive, err := cmd.Flags().GetBool("recursive")
 	if err != nil {
 		return err
 	}
 
-	files, err := collectGoFiles(path, recursive)
+	files, err := collectGoFiles(path, isRecursive)
 	if err != nil {
 		return err
 	}
@@ -63,7 +63,7 @@ func runRemove(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-func collectGoFiles(root string, recursive bool) ([]string, error) {
+func collectGoFiles(root string, isRecursive bool) ([]string, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		return nil, err
@@ -81,7 +81,7 @@ func collectGoFiles(root string, recursive bool) ([]string, error) {
 			return err
 		}
 		if d.IsDir() {
-			if p != root && !recursive {
+			if p != root && !isRecursive {
 				return filepath.SkipDir
 			}
 			return nil
