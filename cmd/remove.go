@@ -5,10 +5,12 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"go/scanner"
 	"go/token"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
@@ -18,13 +20,17 @@ type Comment struct {
 	End   int
 }
 
+var Path string
+var dirCounter = 0
+var fileCounter = 0
+
 // removeCmd represents the remove command
 var removeCmd = &cobra.Command{
 	Use:   "remove",
 	Short: "remove short",
 	Long:  `remove long`,
-	Args:  cobra.ExactArgs(1),
-	Run:   removeComments,
+	Args:  cobra.NoArgs,
+	RunE:  removeComments,
 }
 
 func init() {
@@ -38,7 +44,9 @@ func init() {
 
 	// Cobra supports local flags which will only run when this command
 	// is called directly, e.g.:
-	// removeCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	removeCmd.Flags().BoolP("recursive", "r", false, "recursively checks files in subdirectories")
+	removeCmd.Flags().StringVarP(&Path, "path", "p", "$HOME", "path to file or directory")
+	removeCmd.MarkFlagRequired("path")
 }
 
 func readFile(path string) []byte {
@@ -86,8 +94,44 @@ func scanComments(src []byte) []Comment {
 	return comments
 }
 
-func removeComments(cmd *cobra.Command, args []string) {
-	path := args[0]
+func removeComments(cmd *cobra.Command, args []string) error {
+	path, err := cmd.Flags().GetString("path")
+	if err != nil {
+		return err
+	}
+
+	isRecursive, err := cmd.Flags().GetBool("recursive")
+	if err != nil {
+		return err
+	}
+
+	switch pathType := determinePathType(path); pathType {
+	case "file":
+		processFile(path)
+	case "directory":
+		processDirectory(path, isRecursive)
+	}
+	return nil
+}
+
+func determinePathType(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Fatal(err)
+		os.Exit(1)
+	}
+
+	if info.IsDir() {
+		return "directory"
+	} else {
+		return "file"
+	}
+}
+
+func processFile(path string) {
+	fileCounter++
+	fmt.Println("file:", fileCounter)
+	return
 	src := readFile(path)
 	comments := scanComments(src)
 
@@ -118,4 +162,25 @@ func removeComments(cmd *cobra.Command, args []string) {
 
 	result.Write(src[cursor:])
 	writeFile(path, result.Bytes())
+}
+
+func processDirectory(path string, isRecursive bool) {
+	dirCounter++
+	fmt.Println("dir:", dirCounter)
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		log.Fatal(err)
+		os.Exit(1)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			fullPath := filepath.Join(path, entry.Name())
+			go processDirectory(fullPath, false)
+		} else {
+			if ext := filepath.Ext(filepath.Join(path, entry.Name())); ext == ".go" {
+				go processFile(filepath.Join(path, entry.Name()))
+			}
+		}
+	}
 }

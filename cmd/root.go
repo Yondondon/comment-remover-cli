@@ -11,8 +11,8 @@ import (
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "comment-remover",
-	Short: "CLI app to remove code comments from files",
+	Use:   "cmnt-rmvr",
+	Short: "CLI app to remove comments from code",
 	Long:  ``,
 }
 
